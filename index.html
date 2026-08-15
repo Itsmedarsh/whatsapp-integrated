@@ -1054,6 +1054,7 @@
           <div id="dl-search-hint" style="font-size:12px;color:var(--text2);margin-top:8px;">Type the student's enrollment number (e.g. B-005) and press Enter — their details will appear below.</div>
         </div>
         <div id="dl-student-detail" style="margin-top:14px;"></div>
+        <div id="dl-bookings" style="margin-top:14px;"></div>
         <div id="dl-list" style="margin-top:14px;"></div>
       </div>
 
@@ -2209,7 +2210,7 @@
     </div>
     <div class="form-grid">
       <div class="form-group full"><label>Student *</label>
-        <select id="dl-student" style="width:100%">
+        <select id="dl-student" style="width:100%" onchange="prefillDLContactFromStudent(this)">
           <option value="">Select Student</option>
         </select>
       </div>
@@ -2225,6 +2226,9 @@
         </select>
       </div>
       <div class="form-group"><label>Application / Form No.</label><input type="text" id="dl-form-no" placeholder="Optional"></div>
+      <div class="form-group full"><label>Contact Place</label><input type="text" id="dl-contact-place" placeholder="e.g. RTO Office / Testing Ground / Branch Office"></div>
+      <div class="form-group"><label>Contact Person Name</label><input type="text" id="dl-contact-person" placeholder="e.g. Mr. Kumar / RTO Staff"></div>
+      <div class="form-group"><label>Contact Number</label><input type="tel" id="dl-contact-phone" placeholder="10-digit mobile number"></div>
       <div class="form-group full"><label>Notes</label><textarea id="dl-notes" style="min-height:56px;" placeholder="Any special instructions, documents needed, etc."></textarea></div>
     </div>
     <div style="margin-top:20px;display:flex;gap:10px;border-top:1px solid var(--border);padding-top:16px;">
@@ -4190,7 +4194,7 @@ var FG_WA = {
   },
   // ---- Message templates (edit the text here if needed) ----
   buildMessage: function (type, student) {
-    var name = (student && student.name) ? student.name : 'there';
+    var name = (student && (student.name || student.studentName)) ? (student.name || student.studentName) : 'there';
     var school = FG_WA.schoolName();
     var total = (student && student.totalClasses) ? student.totalClasses : 27;
     var done = (student && student.classes) ? student.classes : 0;
@@ -4247,9 +4251,13 @@ var FG_WA = {
       lines.push('You are now *eligible for your Driving Licence (DL) test*.');
       lines.push('Our team will contact you to book your DL slot. Best of luck! 🍀');
     } else if (type === 'dl_slot_booked') {
-      // 📅 DL TEST SLOT BOOKED message (DL Section)
-      var slotDate = (student && student.dlSlotBookedDate) || '';
-      var slotTime = (student && student.dlSlotTime) || '';
+      // 📅 DL TEST SLOT BOOKED message (DL Section + Schedule DL Test)
+      var slotDate = (student && (student.dlSlotBookedDate || student.date)) || '';
+      var slotTime = (student && (student.dlSlotTime || student.time)) || '';
+      var slotRto = (student && student.rto) || '';
+      var cPlace = (student && (student.contactPlace || student.dlContactPlace || '')) || '';
+      var cPerson = (student && (student.contactPerson || student.dlContactPerson || '')) || '';
+      var cPhone = (student && (student.contactPhone || student.dlContactPhone || '')) || '';
       lines.push('📅 *DL Test Slot Booked — ' + school + '*');
       lines.push('');
       lines.push('Hi ' + name + ',');
@@ -4258,8 +4266,33 @@ var FG_WA = {
       lines.push('📋 *DL Slot Details:*');
       if (slotDate) lines.push('• Test Date: ' + slotDate);
       if (slotTime) lines.push('• Test Time: ' + slotTime);
+      if (slotRto) lines.push('• RTO / Location: ' + slotRto);
       lines.push('');
+      if (cPlace || cPerson || cPhone) {
+        lines.push('📞 *Test Contact:*');
+        if (cPlace) lines.push('• Place: ' + cPlace);
+        if (cPerson) lines.push('• Person: ' + cPerson);
+        if (cPhone) lines.push('• Number: ' + cPhone);
+        lines.push('');
+      }
       lines.push('Please arrive on time with all your documents. All the best! 🍀');
+    } else if (type === 'dl_contact_share') {
+      // 📞 DL test booking note sent to the CONTACT PERSON
+      var cPerson2 = (student && (student.contactPerson || '')) || 'Contact';
+      var slotDate2 = (student && (student.dlSlotBookedDate || student.date)) || '';
+      var slotTime2 = (student && (student.dlSlotTime || student.time)) || '';
+      var slotRto2 = (student && student.rto) || '';
+      var stName = (student && (student.studentName || student.name)) || 'a student';
+      lines.push('📅 *DL Test Booking — ' + school + '*');
+      lines.push('');
+      lines.push('Hi ' + cPerson2 + ',');
+      lines.push(stName + "'s Driving Licence test is booked as follows:");
+      lines.push('');
+      if (slotDate2) lines.push('• Test Date: ' + slotDate2);
+      if (slotTime2) lines.push('• Test Time: ' + slotTime2);
+      if (slotRto2) lines.push('• RTO / Location: ' + slotRto2);
+      lines.push('');
+      lines.push('Please coordinate with the student and keep the documents ready. Thank you! 🙏');
     } else if (type === 'dl_delivered') {
       // 🎊 DL DELIVERED message (DL Section)
       var deliveredDate = (student && student.dlDeliveredDate) || '';
@@ -4328,6 +4361,23 @@ var FG_WA = {
       var opened = FG_WA.openWa(num, text);
       if (opened) showToast('💬 Opening WhatsApp (' + label + ') for ' + (student.name || 'student') + '...');
     } catch(e){ console.warn('FG_WA.send failed:', e.message); }
+  },
+  // Send DL test booking details (from a dlTests record) to the student's phone
+  sendDLBooking: function (test) {
+    try {
+      if (!FG_WA.enabled()) return;
+      if (!test) { FG_WA.closeBlank(); return; }
+      var phone = test.studentPhone || test.phone || '';
+      var num = FG_WA.normalizePhone(phone);
+      if (!num) {
+        FG_WA.closeBlank();
+        showToast('⚠ WhatsApp skipped — no valid student phone for ' + (test.studentName || test.name || 'student'));
+        return;
+      }
+      var text = FG_WA.buildMessage('dl_slot_booked', Object.assign({}, test, { name: test.studentName || test.name || test.student || 'student' }));
+      var opened = FG_WA.openWa(num, text);
+      if (opened) showToast('💬 Opening WhatsApp (DL booking) for ' + (test.studentName || test.name || 'student') + '...');
+    } catch(e){ console.warn('FG_WA.sendDLBooking failed:', e.message); }
   },
   // ---- Fallback panel when window.open is blocked ----
   showFallback: function () {
@@ -10574,6 +10624,9 @@ function getStudentDetailSectionContent(s, tab) {
     const dlSlotBookedDate = s.dlSlotBookedDate || '';
     const dlSlotTime = s.dlSlotTime || '';
     const dlDeliveredDate = s.dlDeliveredDate || '';
+    const dlContactPlace = s.dlContactPlace || '';
+    const dlContactPerson = s.dlContactPerson || '';
+    const dlContactPhone = s.dlContactPhone || '';
     return `
       <div style="background:var(--surface2);border-radius:10px;padding:16px;">
         <div style="font-size:13px;font-weight:600;margin-bottom:12px;">📝 Driving Licence (DL) Information</div>
@@ -10584,6 +10637,9 @@ function getStudentDetailSectionContent(s, tab) {
           <div class="form-group"><label>DL Slot Booked Date</label><input type="date" id="dl-slot-date-${studentId}" value="${dlSlotBookedDate}"></div>
           <div class="form-group"><label>DL Slot Time</label><input type="time" id="dl-slot-time-${studentId}" value="${dlSlotTime}"></div>
           <div class="form-group"><label>DL Delivered Date</label><input type="date" id="dl-delivered-date-${studentId}" value="${dlDeliveredDate}"></div>
+          <div class="form-group"><label>Test-Day Contact Place</label><input type="text" id="dl-contact-place-${studentId}" value="${dlContactPlace}" placeholder="e.g. RTO Counter 3"></div>
+          <div class="form-group"><label>Test-Day Contact Person</label><input type="text" id="dl-contact-person-${studentId}" value="${dlContactPerson}" placeholder="e.g. Mr. Suresh Kumar"></div>
+          <div class="form-group"><label>Test-Day Contact Number</label><input type="tel" id="dl-contact-phone-${studentId}" value="${dlContactPhone}" placeholder="10-digit mobile"></div>
         </div>
         <div style="display:flex;gap:10px;align-items:center;margin-top:14px;">
           <button class="btn btn-accent" onclick="saveStudentCredentialDetails('${studentId}')">Save DL Info</button>
@@ -10671,7 +10727,10 @@ async function saveStudentCredentialDetails(studentId) {
     llApprovedDate: `ll-approved-date-${id}`,
     dlSlotBookedDate: `dl-slot-date-${id}`,
     dlSlotTime: `dl-slot-time-${id}`,
-    dlDeliveredDate: `dl-delivered-date-${id}`
+    dlDeliveredDate: `dl-delivered-date-${id}`,
+    dlContactPlace: `dl-contact-place-${id}`,
+    dlContactPerson: `dl-contact-person-${id}`,
+    dlContactPhone: `dl-contact-phone-${id}`
   };
   const updates = {};
   Object.keys(fields).forEach(key => {
@@ -12960,6 +13019,8 @@ function renderDLSection() {
       if (s) renderDLStudentDetail(s);
     }
   }
+  // FIX: DL test bookings live HERE in the DL Section (delete + WhatsApp re-share)
+  try { renderDLBookings(); } catch(e){}
   const listBox = document.getElementById('dl-list');
   if (listBox) {
     const students = (data.students || []).filter(function(s){ return !currentSchoolId || !s.schoolId || s.schoolId === currentSchoolId; })
@@ -12994,6 +13055,60 @@ function openDLSectionStudent(sid) {
   document.getElementById('dl-student-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
+// ---- DL test bookings management (lives in the DL Section) ----
+function _dlBookingCardHTML(t) {
+  const tid = String(t.firebaseId || t.id || '');
+  const tidSafe = tid.replace(/'/g, "\\'");
+  const statusCls = t.status === 'Passed' ? 'badge-green' : t.status === 'Failed' ? 'badge-red' : 'badge-amber';
+  const studentName = t.studentName || t.student || 'Unknown';
+  return '<div style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:8px;background:#fff;">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
+      '<div style="font-weight:600;font-size:13px;">' + studentName + '</div>' +
+      '<span class="badge ' + statusCls + '">' + (t.status || 'Scheduled') + '</span>' +
+    '</div>' +
+    '<div style="font-size:12px;color:var(--text2);margin-top:2px;">&#x1F4C5; ' + (t.date || '—') + (t.time ? ' &#x23F0; ' + t.time : '') + (t.rto ? ' &#x1F3DB; ' + t.rto : '') + '</div>' +
+    ((t.contactPlace || t.contactPerson || t.contactPhone) ? '<div style="margin-top:6px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:6px 8px;font-size:12px;">' +
+      '<div style="font-weight:600;color:var(--accent2);margin-bottom:3px;">&#x1F4DE; Contact</div>' +
+      (t.contactPlace ? '<div>&#x1F4CD; ' + t.contactPlace + '</div>' : '') +
+      (t.contactPerson ? '<div>&#x1F464; ' + t.contactPerson + '</div>' : '') +
+      (t.contactPhone ? '<div>&#x260E;&#xFE0F; <a href="tel:' + String(t.contactPhone).replace(/[^0-9+]/g,'') + '" style="color:var(--accent2);text-decoration:none;font-weight:600;">' + t.contactPhone + '</a></div>' : '') +
+    '</div>' : '') +
+    '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">' +
+      '<button class="btn btn-accent btn-sm" onclick="shareDLTestWhatsApp(\'' + tidSafe + '\')" title="Re-send the booking details on WhatsApp">&#x1F4F1; WhatsApp</button>' +
+      '<button class="btn btn-outline btn-sm" onclick="deleteDLTest(\'' + tidSafe + '\')" title="Delete this booking permanently">&#x1F5D1; Delete</button>' +
+      (t.status === 'Scheduled' ? '<button class="btn btn-success btn-sm" onclick="markDLTestResult(\'' + tidSafe + '\',\'Passed\')">&#x2705; Passed</button>' : '') +
+      (t.status === 'Scheduled' ? '<button class="btn btn-danger btn-sm" onclick="markDLTestResult(\'' + tidSafe + '\',\'Failed\')">&#x274C; Failed</button>' : '') +
+    '</div>' +
+  '</div>';
+}
+
+function _dlTestsForStudent(s) {
+  const sid = String(s && (s.firebaseId || s.id) || '');
+  const sname = String((s && s.name) || '').toLowerCase().trim();
+  return (data.dlTests || []).filter(function(t){
+    if (currentSchoolId && t.schoolId && t.schoolId !== currentSchoolId) return false;
+    const tStu = String(t.studentId || '');
+    const tName = String(t.studentName || t.student || '').toLowerCase().trim();
+    if (sid && tStu === sid) return true;
+    if (sname && tName === sname) return true;
+    return false;
+  });
+}
+
+// Scheduled DL test bookings — with contact details, WhatsApp re-share & delete
+function renderDLBookings() {
+  const box = document.getElementById('dl-bookings');
+  if (!box) return;
+  const tests = (data.dlTests || [])
+    .filter(function(t){ return !currentSchoolId || !t.schoolId || t.schoolId === currentSchoolId; })
+    .sort(function(a,b){ return String(b.date || '').localeCompare(String(a.date || '')); });
+  box.innerHTML = '<div class="card"><div class="card-title">&#x1F4C5; Scheduled DL Bookings (' + tests.length + ')</div>' +
+    (tests.length === 0
+      ? '<div style="font-size:13px;color:var(--text2);padding:14px;">No DL test bookings yet. Book a slot from <b>DL Test Schedule</b> → Schedule Test.</div>'
+      : tests.map(_dlBookingCardHTML).join('')) +
+    '</div>';
+}
+
 function searchDLStudent() {
   const q = document.getElementById('dl-search') ? document.getElementById('dl-search').value : '';
   const s = findStudentByQuery(q);
@@ -13019,20 +13134,53 @@ function renderDLStudentDetail(s) {
   } else {
     statusHTML = '<div style="background:var(--surface2);border:1px solid var(--border);color:var(--text2);border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:14px;">No DL slot booked yet. Select the <strong>DL Slot Booked Date</strong> when the RTO slot is confirmed.</div>';
   }
+  // This student's DL test bookings (from the dlTests records)
+  const myBookings = _dlTestsForStudent(s);
+  const bookingsHTML = '<div style="border-top:1px solid var(--border);margin:14px 0 10px;"></div>' +
+    '<div style="font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">&#x1F4C5; DL Test Bookings for this Student (' + myBookings.length + ')</div>' +
+    (myBookings.length === 0
+      ? '<div style="font-size:12px;color:var(--text3);padding:6px 0;">No DL test bookings yet for ' + (s.name || 'this student') + '.</div>'
+      : myBookings.map(_dlBookingCardHTML).join(''));
+
+  // 📞 TEST-DAY CONTACT — who the student should contact on arrival at the venue
+  const cPlace = s.dlContactPlace || '';
+  const cPerson = s.dlContactPerson || '';
+  const cPhone = s.dlContactPhone || '';
+  const hasContact = cPlace || cPerson || cPhone;
+  const contactBoxHTML = (hasContact
+    ? '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:12px 14px;margin-bottom:14px;">' +
+        '<div style="font-size:12px;font-weight:700;color:var(--accent2);margin-bottom:6px;">&#x1F4DE; On Arrival — Contact This Person</div>' +
+        '<div style="font-size:13px;line-height:1.9;">' +
+          (cPerson ? '<div>&#x1F464; <strong>' + cPerson + '</strong></div>' : '') +
+          (cPlace ? '<div>&#x1F4CD; ' + cPlace + '</div>' : '') +
+          (cPhone ? '<div>&#x260E;&#xFE0F; <a href="tel:' + String(cPhone).replace(/[^0-9+]/g,'') + '" style="color:var(--accent2);text-decoration:none;font-weight:700;">' + cPhone + '</a></div>' : '') +
+        '</div>' +
+      '</div>'
+    : '<div style="background:var(--surface2);border:1px dashed var(--border);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:var(--text2);">&#x1F4DE; No test-day contact saved yet — enter the <strong>contact place, person &amp; number</strong> below so the student knows whom to contact on arrival.</div>');
+
   box.innerHTML = '<div class="card">' +
     '<div class="card-title">&#x1FAAA; Driving Licence — Student Details</div>' +
     _studentMiniCard(s) +
     '<div style="border-top:1px solid var(--border);margin:14px 0;"></div>' +
     statusHTML +
+    contactBoxHTML +
     '<div class="form-grid">' +
       '<div class="form-group"><label>DL Slot Booked Date</label><input type="date" id="dl-slot-date-' + sid + '" value="' + (s.dlSlotBookedDate || '') + '"></div>' +
       '<div class="form-group"><label>DL Slot Time (optional)</label><input type="time" id="dl-slot-time-' + sid + '" value="' + (s.dlSlotTime || '') + '"></div>' +
       '<div class="form-group"><label>DL Delivered Date</label><input type="date" id="dl-delivered-date-' + sid + '" value="' + (s.dlDeliveredDate || '') + '"></div>' +
     '</div>' +
+    '<div style="border-top:1px solid var(--border);margin:14px 0 10px;"></div>' +
+    '<div style="font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">&#x1F4DE; Test-Day Contact (for the student on arrival)</div>' +
+    '<div class="form-grid">' +
+      '<div class="form-group"><label>Contact Place</label><input type="text" id="dl-contact-place-' + sid + '" value="' + cPlace + '" placeholder="e.g. RTO Office - Counter 3 / Main Gate"></div>' +
+      '<div class="form-group"><label>Contact Person Name</label><input type="text" id="dl-contact-person-' + sid + '" value="' + cPerson + '" placeholder="e.g. Mr. Suresh Kumar"></div>' +
+      '<div class="form-group"><label>Contact Number</label><input type="tel" id="dl-contact-phone-' + sid + '" value="' + cPhone + '" placeholder="10-digit mobile number"></div>' +
+    '</div>' +
     '<div style="display:flex;gap:10px;align-items:center;margin-top:16px;">' +
       '<button class="btn btn-accent" onclick="saveDLSectionInfo()">&#x1F4BE; Save DL Details</button>' +
       '<span id="dl-save-msg" style="font-size:13px;color:var(--success);"></span>' +
     '</div>' +
+    bookingsHTML +
   '</div>';
 }
 
@@ -13048,10 +13196,22 @@ async function saveDLSectionInfo() {
   const newTime = document.getElementById('dl-slot-time-' + sid) ? document.getElementById('dl-slot-time-' + sid).value : '';
   const newDelivered = document.getElementById('dl-delivered-date-' + sid) ? document.getElementById('dl-delivered-date-' + sid).value : '';
 
-  // 💬 WhatsApp: pre-open popup inside the click
-  if ((!oldSlot && newSlot) || (!oldDelivered && newDelivered)) { try { FG_WA.prepare(); } catch(e){} }
+  // 📞 Test-day contact (place / person / number) — saved on the student record
+  const newContactPlace = document.getElementById('dl-contact-place-' + sid) ? document.getElementById('dl-contact-place-' + sid).value.trim() : '';
+  const newContactPerson = document.getElementById('dl-contact-person-' + sid) ? document.getElementById('dl-contact-person-' + sid).value.trim() : '';
+  const newContactPhone = document.getElementById('dl-contact-phone-' + sid) ? document.getElementById('dl-contact-phone-' + sid).value.trim() : '';
 
-  const updates = { dlSlotBookedDate: newSlot, dlSlotTime: newTime, dlDeliveredDate: newDelivered };
+  // 💬 WhatsApp: pre-open popup inside the click
+  if ((!oldSlot && newSlot) || (!oldDelivered && newDelivered) || (newContactPlace || newContactPerson || newContactPhone)) { try { FG_WA.prepare(); } catch(e){} }
+
+  const updates = {
+    dlSlotBookedDate: newSlot,
+    dlSlotTime: newTime,
+    dlDeliveredDate: newDelivered,
+    dlContactPlace: newContactPlace,
+    dlContactPerson: newContactPerson,
+    dlContactPhone: newContactPhone
+  };
   Object.assign(s, updates);
   if (window.__studentDetailModalData && String(window.__studentDetailModalData.firebaseId || '') === sid) Object.assign(window.__studentDetailModalData, updates);
 
@@ -13166,12 +13326,18 @@ function renderDLTests() {
           '<div class="dl-row"><span>&#x1F3DB; RTO Office</span><span>' + (t.rto || '—') + '</span></div>' +
           '<div class="dl-row"><span>&#x1F697; Vehicle Type</span><span>' + (t.vehicle || t.vehicleType || '—') + '</span></div>' +
           (t.formNo ? '<div class="dl-row"><span>&#x1F4CB; Form No.</span><span>' + t.formNo + '</span></div>' : '') +
+          ((t.contactPlace || t.contactPerson || t.contactPhone) ? '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 10px;margin-top:10px;">' +
+            '<div style="font-size:11px;color:var(--accent2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;">&#x1F4DE; Contact Details</div>' +
+            (t.contactPlace ? '<div class="dl-row"><span>&#x1F4CD; Place</span><span>' + t.contactPlace + '</span></div>' : '') +
+            (t.contactPerson ? '<div class="dl-row"><span>&#x1F464; Person</span><span>' + t.contactPerson + '</span></div>' : '') +
+            (t.contactPhone ? '<div class="dl-row"><span>&#x260E;&#xFE0F; Number</span><span><a href="tel:' + String(t.contactPhone).replace(/[^0-9+]/g,'') + '" style="color:var(--accent2);text-decoration:none;font-weight:600;">' + t.contactPhone + '</a></span></div>' : '') +
+          '</div>' : '') +
           (t.notes ? '<div class="dl-row"><span>&#x1F4DD; Notes</span><span style="color:var(--text2);">' + t.notes + '</span></div>' : '') +
-          '<div style="display:flex;gap:8px;margin-top:12px;">' +
+          '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">' +
             (t.status === 'Scheduled' ? '<button class="btn btn-success btn-sm" onclick="markDLTestResult(\'' + tid + '\',\'Passed\')">&#x2705; Passed</button>' : '') +
             (t.status === 'Scheduled' ? '<button class="btn btn-danger btn-sm" onclick="markDLTestResult(\'' + tid + '\',\'Failed\')">&#x274C; Failed</button>' : '') +
-            '<button class="btn btn-outline btn-sm" onclick="cancelDLTest(\'' + tid + '\')">&#x1F5D1; Cancel</button>' +
           '</div>' +
+          '<div style="font-size:11px;color:var(--text3);margin-top:8px;">&#x1F4F1; Delete &amp; WhatsApp re-share options are available in the <strong>DL Section</strong> page.</div>' +
         '</div>';
       }).join('');
     }
@@ -13254,6 +13420,8 @@ function openScheduleDLModal() {
 }
 
 async function scheduleDLTest() {
+  // 💬 WhatsApp: pre-open the popup NOW (inside the click) so it appears instantly
+  try { FG_WA.prepare(); } catch(e){}
   const studentName = document.getElementById('dl-student').value;
   const date = document.getElementById('dl-date').value;
   const time = document.getElementById('dl-time') ? document.getElementById('dl-time').value : '09:00';
@@ -13261,6 +13429,9 @@ async function scheduleDLTest() {
   const vehicleType = document.getElementById('dl-vtype') ? document.getElementById('dl-vtype').value : '';
   const notes = document.getElementById('dl-notes') ? document.getElementById('dl-notes').value : '';
   const formNo = document.getElementById('dl-form-no') ? document.getElementById('dl-form-no').value : '';
+  const contactPlace = document.getElementById('dl-contact-place') ? document.getElementById('dl-contact-place').value.trim() : '';
+  const contactPerson = document.getElementById('dl-contact-person') ? document.getElementById('dl-contact-person').value.trim() : '';
+  const contactPhone = document.getElementById('dl-contact-phone') ? document.getElementById('dl-contact-phone').value.trim() : '';
 
   if (!studentName) { alert('Please select a student'); return; }
   if (!date) { alert('Please select a test date'); return; }
@@ -13268,6 +13439,12 @@ async function scheduleDLTest() {
 
   // Find the student record for full details
   const student = (data.students || []).find(function(s){ return s.name === studentName; });
+
+  // If contact fields are empty in the modal, fall back to the student's saved
+  // test-day contact (entered in the DL Section) so it is never lost
+  const effContactPlace = contactPlace || (student ? (student.dlContactPlace || '') : '');
+  const effContactPerson = contactPerson || (student ? (student.dlContactPerson || '') : '');
+  const effContactPhone = contactPhone || (student ? (student.dlContactPhone || '') : '');
 
   const testEntry = {
     studentName,
@@ -13281,11 +13458,18 @@ async function scheduleDLTest() {
     rto,
     notes: notes || '',
     formNo: formNo || '',
+    contactPlace: effContactPlace,
+    contactPerson: effContactPerson,
+    contactPhone: effContactPhone,
     status: 'Scheduled',
     schoolId: currentSchoolId || '',
     scheduledBy: currentUser ? (currentUser.email || '') : '',
     scheduledAt: new Date().toISOString()
   };
+
+  // 💬 WhatsApp: send the booking details (including test contact) to the
+  // student instantly — uses the pre-opened tab, no waiting for the save
+  try { FG_WA.sendDLBooking(Object.assign({}, testEntry, { phone: testEntry.studentPhone })); } catch(e){ console.warn('WhatsApp DL booking failed:', e.message); }
 
   // Save to Firebase with DataWriter
   let savedId = null;
@@ -13349,6 +13533,8 @@ async function markDLTestResult(testId, result) {
     } catch(e) { console.error('DL result update failed:', e.message); }
   }
   renderDLTests();
+  // Also refresh the DL Section page (bookings status badges)
+  try { if (typeof renderDLSection === 'function') renderDLSection(); } catch(e){}
   addNotification('&#x1FAAA; ' + (test ? (test.studentName||test.student) : 'Student') + ' ' + result + ' DL Test!', result === 'Passed' ? 'success' : 'warning');
   showToast((result === 'Passed' ? '✅' : '❌') + ' DL Test marked as ' + result);
 }
@@ -13365,6 +13551,75 @@ async function cancelDLTest(testId) {
   }
   renderDLTests();
   showToast('🗑 DL test cancelled');
+}
+
+// Delete a DL test booking permanently (Firestore + local)
+async function deleteDLTest(testId) {
+  const test = (data.dlTests || []).find(function(t){ return String(t.firebaseId || t.id) === String(testId); });
+  if (!test) { showToast('⚠ Test not found'); return; }
+  const studentName = test.studentName || test.student || 'Unknown';
+  const ok = confirm('🗑 Delete this DL test booking permanently?\n\n' + studentName + ' — ' + (test.date || 'no date') + (test.time ? ' ' + test.time : '') + '\n\nThis will remove the stored schedule data and cannot be undone.');
+  if (!ok) return;
+
+  data.dlTests = (data.dlTests || []).filter(function(t){ return String(t.firebaseId || t.id) !== String(testId); });
+  const idStr = String(testId);
+  if (typeof db !== 'undefined' && currentSchoolId && idStr && !idStr.startsWith('local-') && !idStr.startsWith('sync-') && !idStr.startsWith('queue-')) {
+    try {
+      const delSuccess = await DataWriter.queueWrite('delete', 'schools/' + currentSchoolId + '/dlTests', idStr, {});
+      FGCache.invalidate(currentSchoolId, 'dlTests');
+      EnhancedCache.del(currentSchoolId, 'dlTests').catch(e => {});
+      if (!delSuccess) console.warn('DL delete queued for sync');
+    } catch(e) { console.error('DL test delete failed:', e.message); }
+  }
+  renderDLTests();
+  // Also refresh the DL Section page (bookings list + open student card)
+  try { if (typeof renderDLSection === 'function') renderDLSection(); } catch(e){}
+  showToast('🗑 DL test booking deleted');
+}
+
+// Re-share the DL test booking details on WhatsApp (student + contact person)
+function shareDLTestWhatsApp(testId) {
+  const test = (data.dlTests || []).find(function(t){ return String(t.firebaseId || t.id) === String(testId); });
+  if (!test) { showToast('⚠ Test not found'); return; }
+  // 💬 instant popup inside the click
+  try { FG_WA.prepare(); } catch(e){}
+  const stu = (data.students || []).find(function(s){ return s.name === (test.studentName || test.student); });
+  const payload = Object.assign({}, test, {
+    name: test.studentName || test.student || 'Student',
+    phone: test.studentPhone || (stu ? stu.phone : '') || ''
+  });
+  FG_WA.sendDLBooking(payload);
+  // Also queue the booking note to the contact person's number (fallback panel)
+  if (test.contactPhone) {
+    try {
+      const cNum = FG_WA.normalizePhone(test.contactPhone);
+      const sNum = FG_WA.normalizePhone(payload.phone);
+      if (cNum && cNum !== sNum) {
+        const cMsg = FG_WA.buildMessage('dl_contact_share', Object.assign({}, test, { name: test.studentName || test.student || 'Student' }));
+        FG_WA.pending.push({ url: 'https://wa.me/' + cNum + '?text=' + encodeURIComponent(cMsg), number: cNum, text: cMsg });
+        FG_WA.showFallback();
+        showToast('📲 Also queued WhatsApp for contact person (' + test.contactPhone + ')');
+      }
+    } catch(e){ console.warn('Contact person WhatsApp failed:', e.message); }
+  }
+}
+
+// When a student is picked in the Schedule DL modal, auto-fill the contact
+// place / person / number from the student's saved test-day contact (DL Section).
+function prefillDLContactFromStudent(sel) {
+  try {
+    const name = sel ? sel.value : '';
+    if (!name) return;
+    const student = (data.students || []).find(function(s){ return s.name === name; });
+    if (!student) return;
+    const setVal = function(id, v) {
+      const el = document.getElementById(id);
+      if (el && v && !el.value) el.value = v;
+    };
+    setVal('dl-contact-place', student.dlContactPlace || '');
+    setVal('dl-contact-person', student.dlContactPerson || '');
+    setVal('dl-contact-phone', student.dlContactPhone || '');
+  } catch(e) { console.warn('prefillDLContactFromStudent failed:', e.message); }
 }
 
 function quickSchedule(name) {
@@ -22557,5 +22812,5 @@ function populateFormFromStudentId(value) {
   <div id="fg-wa-panel-list" style="max-height:280px;overflow:auto;display:flex;flex-direction:column;gap:8px;"></div>
 </div>
 
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a27cbfda39cd1f33',t:'MTc4NjE3MzUzMQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
