@@ -4163,13 +4163,48 @@ var FG_WA = {
     return '91'; // India default
   },
   schoolName: function () {
+    // FIX: resolve the LOGGED-IN school name — never show the website/brand name.
+    // 1) Explicitly cached name, keyed PER SCHOOL (so owner & staff sharing one
+    //    device never see each other's school name)
+    try {
+      var sid = (typeof currentSchoolId !== 'undefined') ? currentSchoolId : '';
+      if (sid && FG_WA._schoolNames && FG_WA._schoolNames[sid]) return FG_WA._schoolNames[sid];
+    } catch(e){}
+    // 2) localStorage cache — PER SCHOOL only (a global key would leak one
+    //    school's name to another when owner & staff share the same device)
+    try {
+      var sid2 = (typeof currentSchoolId !== 'undefined') ? currentSchoolId : '';
+      var ls = sid2 ? localStorage.getItem('fg_school_name_' + sid2) : null;
+      if (ls && ls.trim()) return ls;
+    } catch(e){}
+    // 3) userSchools lookup (real name only — skip placeholder entries)
     try {
       if (typeof userSchools !== 'undefined' && userSchools && currentSchoolId) {
         var s = userSchools.find(function(x){ return x.id === currentSchoolId; });
-        if (s && s.name) return s.name;
+        if (s && s.name && String(s.name).indexOf('School (details') !== 0 && String(s.name).trim()) return s.name;
       }
     } catch(e){}
-    return 'First Gear Driving School';
+    // 4) loaded school doc / data.school
+    try { if (typeof data !== 'undefined' && data && data.school && data.school.name) return data.school.name; } catch(e){}
+    // 5) DOM element that shows the current school name in the sidebar/header
+    try {
+      var el = document.getElementById('admin-school-name') || document.getElementById('current-school-label');
+      if (el && el.textContent && el.textContent.trim()) return el.textContent.trim();
+    } catch(e){}
+    // 6) last resort: generic label (NOT the website brand)
+    return 'Our Driving School';
+  },
+  // Remember the logged-in school name so every message uses it (per school)
+  setSchoolName: function (name) {
+    if (!name) return;
+    try {
+      name = String(name).trim();
+      if (!name) return;
+      FG_WA._schoolNames = FG_WA._schoolNames || {};
+      var sid = (typeof currentSchoolId !== 'undefined') ? currentSchoolId : 'default';
+      FG_WA._schoolNames[sid] = name;
+      try { localStorage.setItem('fg_school_name_' + sid, name); } catch(e){}
+    } catch(e){}
   },
   // Returns digits including country code for the wa.me link, or null if invalid
   normalizePhone: function (phone) {
@@ -4585,18 +4620,48 @@ async function handleUserLoggedIn(user, selectedRole, loginBtn, originalText) {
   }
 }
 
+// Merge a school into a user's /userSchools index WITHOUT destroying existing
+// entries — preserves schoolIds, roles and ownerEmails for every school the
+// user already belongs to (previously `roles: { [schoolId]: role }` + merge
+// erased all other schools' roles, which hid schools from staff logins).
+async function mergeUserSchoolsIndex(userId, schoolId, role, ownerEmail) {
+  if (!userId || !schoolId || typeof db === 'undefined') return false;
+  try {
+    const ref = db.collection('userSchools').doc(userId);
+    const doc = await ref.get();
+    const cur = doc.exists ? doc.data() : {};
+    const schoolIds = Array.isArray(cur.schoolIds) ? cur.schoolIds.slice() : [];
+    if (schoolIds.indexOf(schoolId) === -1) schoolIds.push(schoolId);
+    const roles = Object.assign({}, cur.roles || {});
+    roles[schoolId] = role || roles[schoolId] || 'office';
+    const ownerEmails = Object.assign({}, cur.ownerEmails || {});
+    ownerEmails[schoolId] = ownerEmail || ownerEmails[schoolId] || null;
+    await ref.set({ schoolIds, roles, ownerEmails, updatedAt: new Date().toISOString() });
+    return true;
+  } catch (e) {
+    console.warn('mergeUserSchoolsIndex failed:', e.message);
+    return false;
+  }
+}
+
 async function writeUserSchoolsIndexAsCreatedUser(secondaryApp, userId, schoolId, role, ownerEmail) {
   if (!secondaryApp || !userId || !schoolId) {
     throw new Error('Missing secondary app, user ID, or school ID for userSchools index write');
   }
 
   const secondaryDb = secondaryApp.firestore();
-  await secondaryDb.collection('userSchools').doc(userId).set({
-    schoolIds: firebase.firestore.FieldValue.arrayUnion(schoolId),
-    roles: { [schoolId]: role },
-    ownerEmails: { [schoolId]: ownerEmail || null },
-    updatedAt: new Date().toISOString()
-  }, { merge: true });
+  // FIX: read-modify-write so adding a staff member to ANOTHER school never
+  // wipes the roles/ownerEmails of the schools they already belong to.
+  const ref = secondaryDb.collection('userSchools').doc(userId);
+  const doc = await ref.get();
+  const cur = doc.exists ? doc.data() : {};
+  const schoolIds = Array.isArray(cur.schoolIds) ? cur.schoolIds.slice() : [];
+  if (schoolIds.indexOf(schoolId) === -1) schoolIds.push(schoolId);
+  const roles = Object.assign({}, cur.roles || {});
+  roles[schoolId] = role || 'office';
+  const ownerEmails = Object.assign({}, cur.ownerEmails || {});
+  ownerEmails[schoolId] = ownerEmail || null;
+  await ref.set({ schoolIds, roles, ownerEmails, updatedAt: new Date().toISOString() });
 }
 
 function getAttendanceUserKey(user) {
@@ -5749,7 +5814,130 @@ const FirebaseService = {
       throw error;
     }
   },
-  
+
+  // ──────────────────────────────────────────────────────────────
+  // DISCOVERY + SELF-REPAIR of the /userSchools index.
+  // The index doc can be incomplete (a staff member added to a second
+  // school before the dual-write fix, or the roles map overwritten by
+  // old code). Firestore rules only let the user write their OWN index
+  // doc, so the repair MUST run as the logged-in user — right here.
+  // We probe every available collectionGroup (staff + users × userId +
+  // email) and merge every school found into (a) the returned list and
+  // (b) the user's own index doc so future logins are fast + complete.
+  // NOTE: the collectionGroup queries need composite indexes — see the
+  // generated firestore.indexes.json. If they fail, we fall back to the
+  // index data (and surface a one-time warning).
+  // ──────────────────────────────────────────────────────────────
+  async supplementMemberSchoolsFromCollections(userId, baseList) {
+    baseList = baseList || [];
+    try {
+      const key = 'fg_supp:' + userId;
+      const cached = window.__fgSupplementCache;
+      const now = Date.now();
+      if (cached && cached.key === key && now - cached.ts < 60000) {
+        // Apply cached discovery (fast path — skip the queries this session)
+        cached.schools.forEach(function(cs) {
+          if (!baseList.some(function(s){ return s.id === cs.schoolId; })) {
+            baseList.push({ id: cs.schoolId, userRole: cs.role, name: cs.name || 'School (details unavailable)', _fromIndex: true, _supplemented: true });
+          }
+        });
+        return baseList;
+      }
+
+      let email = null;
+      try { const u = await this.getCurrentUser(); email = u ? u.email : null; } catch(e){}
+
+      const found = {};   // schoolId -> role (instructor > office priority)
+      const candidates = [];
+      if (userId) {
+        candidates.push({ label: 'staff-userId',  run: () => db.collectionGroup('staff').where('userId', '==', userId).get() });
+        candidates.push({ label: 'staff-userID',  run: () => db.collectionGroup('staff').where('userID', '==', userId).get() });
+        candidates.push({ label: 'staff-firebaseId', run: () => db.collectionGroup('staff').where('firebaseId', '==', userId).get() });
+        candidates.push({ label: 'users-userId',  run: () => db.collectionGroup('users').where('userId', '==', userId).get() });
+      }
+      if (email) {
+        candidates.push({ label: 'staff-email',   run: () => db.collectionGroup('staff').where('email', '==', email).get() });
+        candidates.push({ label: 'users-email',   run: () => db.collectionGroup('users').where('email', '==', email).get() });
+      }
+
+      let anyQuerySucceeded = false;
+      for (const c of candidates) {
+        let snap = null;
+        try { snap = await c.run(); anyQuerySucceeded = true; } catch(e) { console.warn('[school discovery] query failed (' + c.label + '):', e.message); continue; }
+        if (!snap || snap.empty) continue;
+        (snap.docs || []).forEach(function(doc) {
+          try {
+            const d = doc.data() || {};
+            const schoolId = d.schoolId || (doc.ref && doc.ref.parent && doc.ref.parent.parent ? doc.ref.parent.parent.id : '');
+            if (!schoolId) return;
+            const rawRole = d.role || d.userRole || 'office';
+            const role = rawRole === 'instructor' ? 'instructor' : (rawRole === 'admin' ? 'office' : 'office');
+            if (!found[schoolId] || found[schoolId] !== 'instructor') found[schoolId] = role;
+          } catch(e2) {}
+        });
+      }
+
+      if (!anyQuerySucceeded) {
+        // All collectionGroup queries failed — indexes likely not deployed.
+        try {
+          if (!window.__fgIdxWarnShown) {
+            window.__fgIdxWarnShown = true;
+            console.warn('[school discovery] collectionGroup queries failed — deploy firestore.indexes.json so multi-school access works. Showing only indexed schools.');
+            try { if (typeof showToast === 'function') showToast('⚠ Multi-school access limited — deploy Firestore indexes (see firestore.indexes.json)'); } catch(e){}
+          }
+        } catch(e){}
+        return baseList;
+      }
+
+      const added = [];
+      for (const sid of Object.keys(found)) {
+        if (baseList.some(function(s){ return s.id === sid; })) continue;
+        const role = found[sid];
+        let name = null;
+        try {
+          const sdoc = await this.schoolsRef.doc(sid).get();
+          if (sdoc.exists && sdoc.data().status !== 'deleted') {
+            baseList.push({ id: sid, ...sdoc.data(), userRole: role, _supplemented: true });
+            name = sdoc.data().name || null;
+          } else { continue; }
+        } catch(e) {
+          baseList.push({ id: sid, userRole: role, name: 'School (details unavailable)', _fromIndex: true, _supplemented: true });
+        }
+        added.push({ schoolId: sid, role: role, name: name });
+      }
+
+      // Self-repair the user's OWN index doc (rules allow it) so future
+      // logins read the complete list from the fast path.
+      if (added.length > 0 && userId && typeof db !== 'undefined') {
+        try {
+          const ref = db.collection('userSchools').doc(userId);
+          const idxDoc = await ref.get();
+          const cur = idxDoc.exists ? idxDoc.data() : {};
+          const schoolIds = Array.isArray(cur.schoolIds) ? cur.schoolIds.slice() : [];
+          const roles = Object.assign({}, cur.roles || {});
+          const ownerEmails = Object.assign({}, cur.ownerEmails || {});
+          let changed = false;
+          added.forEach(function(a) {
+            if (schoolIds.indexOf(a.schoolId) === -1) { schoolIds.push(a.schoolId); changed = true; }
+            if (roles[a.schoolId] !== a.role) { roles[a.schoolId] = a.role; changed = true; }
+            if (!ownerEmails[a.schoolId]) { ownerEmails[a.schoolId] = null; changed = true; }
+          });
+          if (changed) await ref.set({ schoolIds: schoolIds, roles: roles, ownerEmails: ownerEmails, updatedAt: new Date().toISOString() });
+        } catch(idxErr) { console.warn('[school discovery] index self-repair failed:', idxErr.message); }
+      }
+
+      // Session cache so subsequent getUserMemberSchools calls skip the queries
+      try {
+        window.__fgSupplementCache = { key: key, ts: now, schools: Object.keys(found).map(function(sid){ return { schoolId: sid, role: found[sid], name: (baseList.find(function(s){ return s.id === sid; }) || {}).name || null }; }) };
+      } catch(e){}
+
+      return baseList;
+    } catch (e) {
+      console.warn('supplementMemberSchoolsFromCollections failed:', e.message);
+      return baseList;
+    }
+  },
+
   async getUserMemberSchools(userId) {
     // ── Strategy ──────────────────────────────────────────────────────────────
     // We store a top-level document at /userSchools/{uid} when an admin is
@@ -5812,7 +6000,9 @@ const FirebaseService = {
             }
           }
         }
-        return userSchools;
+        // FIX: the index can be incomplete — discover ALL schools the user
+        // belongs to (staff/users subcollections) and self-repair the index.
+        return await this.supplementMemberSchoolsFromCollections(userId, userSchools);
       }
 
       // Fallback: try reading the UID-keyed user doc directly if we know the schoolId
@@ -5870,7 +6060,8 @@ const FirebaseService = {
         console.warn('collectionGroup query failed (index may not be deployed):', cgErr.message);
       }
 
-      return userSchools;
+      // FIX: also discover + repair from the staff/users subcollections
+      return await this.supplementMemberSchoolsFromCollections(userId, userSchools);
     } catch (error) {
       console.error('Error getting user member schools:', error);
       throw error;
@@ -6053,6 +6244,34 @@ async function loadUserMemberSchools() {
     userSchools = _loginTimeMemberSchools || await FirebaseService.getUserMemberSchools(currentUser.uid);
     _loginTimeMemberSchools = null; // Clear cache after use
     const memberSchools = userSchools; // Keep for UI updates
+
+    // FIX: make sure every school has its REAL name — placeholder entries from
+    // the index fallback break WhatsApp messages & the school switcher.
+    (memberSchools || []).forEach(function(school) {
+      if (school && (!school.name || String(school.name).indexOf('School (details') === 0) && typeof db !== 'undefined') {
+        db.collection('schools').doc(school.id).get().then(function(doc) {
+          try {
+            if (doc.exists && doc.data() && doc.data().name) {
+              school.name = doc.data().name;
+              FG_WA.setSchoolName(school.name);
+              // refresh dropdown label
+              const sel = document.getElementById('school-select');
+              if (sel) {
+                const opts = sel.querySelectorAll('option');
+                for (let oi = 0; oi < opts.length; oi++) {
+                  if (opts[oi].value === school.id) opts[oi].textContent = school.name + (school.userRole ? ' (' + school.userRole + ')' : '');
+                }
+              }
+            }
+          } catch(e2) {}
+        }).catch(function(){});
+      }
+    });
+    // Also cache the current school's name for WhatsApp immediately
+    try {
+      const cur = (memberSchools || []).find(function(x){ return x.id === currentSchoolId; });
+      if (cur && cur.name && String(cur.name).indexOf('School (details') !== 0 && String(cur.name).trim()) FG_WA.setSchoolName(cur.name);
+    } catch(e){}
     
     const schoolSelect = document.getElementById('school-select');
     if (schoolSelect) {
@@ -6591,58 +6810,10 @@ async function verifyUserRole(userId, selectedRole) {
         return storedRole === selectedRole;
       });
       
-      // Fallback: back-fill users subcollection for staff created before the dual-write fix.
-      // Triggered when: no schools at all, OR all schools are _fromIndex (school doc unreadable,
-      // meaning the users/{uid} doc is missing so Firestore rules block school reads).
-      const needsBackfill = memberSchools.length === 0 ||
-        memberSchools.every(s => s._fromIndex);
-      if (needsBackfill) {
-        console.log('No member schools found via userSchools index — trying staff subcollection fallback');
-        try {
-          const staffSnap = await db.collectionGroup('staff').where('userId', '==', userId).get();
-          if (!staffSnap.empty) {
-            for (const staffDoc of staffSnap.docs) {
-              const staffData = staffDoc.data();
-              const schoolId = staffData.schoolId || staffDoc.ref.parent.parent.id;
-              const staffRole = staffData.role === 'instructor' ? 'instructor' : 'office';
-              if (staffRole === selectedRole && schoolId) {
-                console.log('Found staff record in schools/' + schoolId + '/staff, role:', staffRole);
-                // Back-fill the users subcollection and userSchools index so future logins use the fast path
-                const ownerEmail = staffData.ownerEmail || null;
-                try {
-                  await db.collection('schools').doc(schoolId).collection('users').doc(userId).set({
-                    userId,
-                    role: staffRole,
-                    userRole: staffRole,
-                    name: staffData.name,
-                    email: staffData.email,
-                    schoolId,
-                    status: 'active',
-                    addedAt: firebase.firestore.FieldValue.serverTimestamp()
-                  }, { merge: true });
-                  await db.collection('userSchools').doc(userId).set({
-                    schoolIds: firebase.firestore.FieldValue.arrayUnion(schoolId),
-                    roles: { [schoolId]: staffRole },
-                    ownerEmails: { [schoolId]: ownerEmail },
-                    updatedAt: new Date().toISOString()
-                  }, { merge: true });
-                  console.log('Back-filled users doc and userSchools index for staff user', userId);
-                } catch (backfillErr) {
-                  console.warn('Back-fill failed (non-fatal):', backfillErr.message);
-                }
-                hasRole = true;
-                // Reload memberSchools so currentSchoolId can be set downstream
-                const reloaded = await FirebaseService.getUserMemberSchools(userId);
-                userSchools = reloaded.length > 0 ? reloaded : [{ id: schoolId, userRole: staffRole }];
-                break;
-              }
-            }
-          }
-        } catch (staffFallbackErr) {
-          console.warn('Staff subcollection fallback failed (index may not be deployed):', staffFallbackErr.message);
-        }
-      }
-      
+      // FIX (multi-school): getUserMemberSchools() already discovers and
+      // self-repairs every school the user belongs to (staff/users subcollections),
+      // so memberSchools above is the COMPLETE list — no extra scan needed here.
+
       console.log('Has role result:', hasRole);
       
       if (hasRole) {
@@ -7556,6 +7727,25 @@ function renderAllData() {
   if (currentRole === 'instructor') {
     renderDriverFuelPage();
   }
+
+  // FIX: school quick-switch for office & instructor too (only schools they
+  // have access to — userSchools holds exactly those schools)
+  if (currentRole === 'office' || currentRole === 'instructor') {
+    try { renderSchoolSwitcher(); } catch(e){}
+  }
+
+  // FIX: remember the logged-in school name so every WhatsApp message shows
+  // the driving school name (not the website/brand name)
+  try {
+    if (currentSchoolId) {
+      const _sc = (userSchools || []).find(function(x){ return x.id === currentSchoolId; });
+      if (_sc && _sc.name && String(_sc.name).indexOf('School (details') !== 0 && String(_sc.name).trim()) FG_WA.setSchoolName(_sc.name);
+      else {
+        const _el = document.getElementById('admin-school-name');
+        if (_el && _el.textContent && _el.textContent.trim()) FG_WA.setSchoolName(_el.textContent.trim());
+      }
+    }
+  } catch(e){}
 }
 
 function refreshPage(id) {
@@ -9202,6 +9392,8 @@ async function selectSchoolForView(schoolId, schoolName) {
   // Set the current school
   FirebaseService.setSchool(schoolId);
   currentSchoolId = schoolId;
+  // FIX: remember the logged-in school name so WhatsApp messages use it
+  try { FG_WA.setSchoolName(schoolName || ((userSchools||[]).find(function(x){ return x.id === schoolId; }) || {}).name || ''); } catch(e){}
 
   // Clear only this school's stale data before reloading (other schools kept intact)
   data.students     = (data.students||[]).filter(s => s.schoolId && s.schoolId !== schoolId);
@@ -10852,6 +11044,7 @@ async function sendStudentClassSchedule(studentId) {
     classTitle,
     studentName: student.name || '',
     note,
+    schoolName: FG_WA.schoolName(),   // FIX: logged-in school name (not the brand)
     scheduleId: student.firebaseId || student.id || ''
   };
 
@@ -12349,10 +12542,7 @@ async function renderReport() {
 
   const schoolTx = getSchoolTransactionsWithMappedInstallments(data.transactions || []);
 
-  const schoolName = (function(){
-    var s = (userSchools||[]).find(function(s){ return s.id === currentSchoolId; });
-    return (s && s.name) ? s.name : (data.school && data.school.name ? data.school.name : 'First Gear Driving School');
-  })();
+  const schoolName = FG_WA.schoolName();
 
   const monthNames = ['January','February','March','April','May','June',
                       'July','August','September','October','November','December'];
@@ -12564,10 +12754,7 @@ function exportReportPDF() {
       ? (df && df.value ? df.value : new Date().toISOString().slice(0,10))
       : (yf && yf.value ? yf.value : new Date().getFullYear());
 
-  const schoolName = (function(){
-    var s = (userSchools||[]).find(function(s){ return s.id === currentSchoolId; });
-    return (s && s.name) ? s.name : 'First Gear Driving School';
-  })();
+  const schoolName = FG_WA.schoolName();
 
   const rcEl = document.getElementById('report-content');
   if (!rcEl || !rcEl.innerHTML.trim()) { alert('No report data to export.'); return; }
@@ -12623,10 +12810,7 @@ function exportReportExcel() {
 
   const schoolTx = getSchoolTransactionsWithMappedInstallments(data.transactions || []);
 
-  const schoolName = (function(){
-    var s = (userSchools||[]).find(function(s){ return s.id === currentSchoolId; });
-    return (s && s.name) ? s.name : 'First Gear Driving School';
-  })();
+  const schoolName = FG_WA.schoolName();
 
   const monthNames = ['January','February','March','April','May','June',
                       'July','August','September','October','November','December'];
@@ -16858,7 +17042,7 @@ function generateStudentInvoice(id) {
       const installments = s.installments||[];
       const today = new Date().toLocaleDateString('en-IN',{year:'numeric',month:'long',day:'numeric'});
       const school = (userSchools.find(function(sc){return sc.id===currentSchoolId;})||{});
-      const schoolName = school.name || 'First Gear School';
+      const schoolName = school.name || FG_WA.schoolName();
       const schoolAddress = school.address || '';
       const schoolPhone = school.phone || '';
 
@@ -17315,7 +17499,7 @@ function renderFormsRegistry(formType) {
   if (!page) return;
 
   const school = getCurrentSchool();
-  const schoolName    = school.name    || 'First Gear Driving School';
+  const schoolName    = school.name    || FG_WA.schoolName();
   const schoolAddress = school.address || '';
   const schoolPhone   = school.phone   || '';
   const licenseNo     = school.licenseNo || school.license || '';
@@ -18027,7 +18211,7 @@ function printFormRecord(id, formTypeCode) {
   if (!f) { showToast('Record not found'); return; }
 
   const school = getCurrentSchool();
-  const schoolName    = school.name    || 'First Gear Driving School';
+  const schoolName    = school.name    || FG_WA.schoolName();
   const schoolAddress = school.address || '';
   const schoolPhone   = school.phone   || '';
   const licenseNo     = school.licenseNo || school.license || '';
@@ -18269,7 +18453,7 @@ function printForm15ForService(id) {
   if (!svc) { showToast('Service record not found'); return; }
 
   const school = getCurrentSchool();
-  const schoolName    = school.name    || 'First Gear Driving School';
+  const schoolName    = school.name    || FG_WA.schoolName();
   const schoolAddress = school.address || '';
   const schoolPhone   = school.phone   || '';
   const licenseNo     = school.licenseNo || school.license || '';
@@ -18404,7 +18588,7 @@ function printForm15ForStudent(studentId) {
   if (!student) { showToast('Student not found'); return; }
 
   const school = getCurrentSchool();
-  const schoolName    = school.name    || 'First Gear Driving School';
+  const schoolName    = school.name    || FG_WA.schoolName();
   const schoolAddress = school.address || '';
   const schoolPhone   = school.phone   || '';
   const licenseNo     = school.licenseNo || school.license || '';
@@ -19438,7 +19622,7 @@ async function generateServiceInvoice(id) {
     }
   }
   const today = new Date().toLocaleDateString('en-IN',{year:'numeric',month:'long',day:'numeric'});
-  const schoolName = (userSchools.find(sc=>sc.id===currentSchoolId)||{}).name||'First Gear School';
+  const schoolName = (userSchools.find(sc=>sc.id===currentSchoolId)||{}).name||FG_WA.schoolName();
   const old = document.getElementById('modal-service-invoice');
   if (old) old.remove();
   const modal = document.createElement('div');
@@ -19542,7 +19726,7 @@ async function generateServiceInvoice(id) {
           <div style="font-size:12px;color:#64748b;">Signatory name and stamp</div>
         </div>
         <div style="display:flex;flex-direction:column;justify-content:flex-end;gap:8px;font-size:12px;color:#64748b;">
-          <div>Thank you for choosing First Gear Driving School.</div>
+          <div>Thank you for choosing ${schoolName}.</div>
           <div>Generated on ${today}</div>
         </div>
       </div>
@@ -19771,7 +19955,7 @@ function sendDailyIncomeExpenseSummary() {
   showToast(msg.substring(0, 80));
   // Also try browser notification
   if ('Notification' in window && Notification.permission === 'granted') {
-    new Notification('First Gear Daily Summary', {
+    new Notification(FG_WA.schoolName() + ' Daily Summary', {
       body: `Income: ₹${totalIncome.toLocaleString()} | Expense: ₹${totalExpense.toLocaleString()} | Net: ₹${profit.toLocaleString()} | Classes: ${classesCount} | Staff Present: ${staffPresentCount}`,
       icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y="75" font-size="75">🚗</text></svg>'
     });
@@ -19784,18 +19968,22 @@ function showDailySummaryNow() {
 }
 
 // ============================================================
-// SCHOOL QUICK-SWITCH FOR OWNER (no re-login)
+// SCHOOL QUICK-SWITCH (owner / office / instructor — only the
+// schools the logged-in user has access to via userSchools)
 // ============================================================
 function renderSchoolSwitcher() {
   const switcher = document.getElementById('owner-school-switcher');
-  if (!switcher || currentRole !== 'owner') return;
-  const schools = userSchools || [];
+  if (!switcher) return;
+  const schools = (userSchools || []).filter(Boolean);
   if (schools.length <= 1) { switcher.style.display = 'none'; return; }
   switcher.style.display = 'flex';
   switcher.innerHTML = `
     <span style="font-size:12px;color:rgba(255,255,255,0.5);margin-right:4px;">🏫</span>
     <select onchange="quickSwitchSchool(this.value)" style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);color:white;padding:5px 8px;border-radius:6px;font-size:12px;cursor:pointer;max-width:160px;">
-      ${schools.map(sc => `<option value="${sc.id}" ${sc.id===currentSchoolId?'selected':''}>${sc.name}</option>`).join('')}
+      ${schools.map(sc => {
+        const nm = (sc.name && String(sc.name).indexOf('School (details') !== 0 && String(sc.name).trim()) ? sc.name : ('School ' + (schools.indexOf(sc) + 1));
+        return `<option value="${sc.id}" ${sc.id===currentSchoolId?'selected':''}>${nm}</option>`;
+      }).join('')}
     </select>`;
 }
 
@@ -19803,8 +19991,16 @@ async function quickSwitchSchool(schoolId) {
   if (!schoolId || schoolId === currentSchoolId) return;
   const school = (userSchools||[]).find(s=>s.id===schoolId);
   if (!school) return;
+  // FIX: if the school record has a placeholder/missing name, fetch the real one
+  let sname = school.name;
+  if (!sname || String(sname).indexOf('School (details') === 0) {
+    try {
+      const d = await db.collection('schools').doc(schoolId).get();
+      if (d.exists && d.data() && d.data().name) { sname = d.data().name; school.name = sname; }
+    } catch(e) { console.warn('Could not fetch school name:', e.message); }
+  }
   // Switch without re-login
-  await selectSchoolForView(schoolId, school.name);
+  await selectSchoolForView(schoolId, sname);
   renderSchoolSwitcher();
 }
 
@@ -20761,14 +20957,10 @@ async function repairStaffLoginAccess() {
         console.warn('Could not write users doc for', uid, ':', e.message);
       }
 
-      // Write /userSchools/{uid}
+      // Write /userSchools/{uid} — FIX: preserve the user's existing schools
+      // (roles/ownerEmails must not be wiped when repairing another school)
       try {
-        await db.collection('userSchools').doc(uid).set({
-          schoolIds: firebase.firestore.FieldValue.arrayUnion(currentSchoolId),
-          roles: { [currentSchoolId]: normalizedRole },
-          ownerEmails: { [currentSchoolId]: ownerEmail },
-          updatedAt: new Date().toISOString()
-        }, { merge: true });
+        await mergeUserSchoolsIndex(uid, currentSchoolId, normalizedRole, ownerEmail);
       } catch (e) {
         console.warn('Could not write userSchools doc for', uid, ':', e.message);
       }
@@ -21235,11 +21427,20 @@ async function updateStaff(staffId) {
         userRole: normalizedRole,
         updatedAt: new Date().toISOString()
       }, { merge: true });
-      // Also update the userSchools index role
-      await db.collection('userSchools').doc(staffId).set({
-        roles: { [currentSchoolId]: normalizedRole },
-        updatedAt: new Date().toISOString()
-      }, { merge: true });
+      // Also update the userSchools index role — FIX: preserve the roles of the
+      // other schools this staff member belongs to (never wipe them)
+      try {
+        const idxDoc2 = await db.collection('userSchools').doc(staffId).get();
+        const idxData2 = idxDoc2.exists ? idxDoc2.data() : {};
+        const roles2 = Object.assign({}, idxData2.roles || {});
+        roles2[currentSchoolId] = normalizedRole;
+        await db.collection('userSchools').doc(staffId).set({
+          roles: roles2,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+      } catch (idxSyncErr2) {
+        console.warn('Index role sync failed (non-fatal):', idxSyncErr2.message);
+      }
     } catch (syncErr) {
       console.warn('Role sync to users/userSchools failed (non-fatal):', syncErr.message);
     }
@@ -22814,4 +23015,3 @@ function populateFormFromStudentId(value) {
 
 </body>
 </html>
-
