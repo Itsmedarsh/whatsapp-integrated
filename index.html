@@ -9741,56 +9741,91 @@ function renderDashboard() {
 // ============================================================
 function getStudentIdSortValue(student) {
   const rawId = (student.studentId || '').toString().trim();
+  // Enrollment date as tiebreaker — newest students first (fixes the
+  // "August at the bottom, July on top" confusion for students without IDs)
+  let dateKey = '00000000';
+  try {
+    const enr = String(student.enrolled || student.createdAt || '');
+    const dm = enr.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (dm) dateKey = dm[1] + dm[2] + dm[3];
+  } catch(e){}
+
+  const FG_MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  let seriesKey = '   ';   // no series → sorts last
+  let numStr = '000000000000';
+
   if (rawId) {
-    // Split the ID into [series letter][number] — e.g. "B-012" → series "B", number "012";
-    // "FG-A-001" → series "A". Sorting is DESCENDING ALPHABETICAL by series first,
-    // so the B-series always comes before the A-series, then by number (newest first).
     const numMatch = rawId.match(/(\d+)\s*$/);
-    let series = '';
-    let numStr = '';
+    let prefix = rawId;
     if (numMatch) {
-      numStr = numMatch[1];
-      const before = rawId.slice(0, numMatch.index);
-      const letterMatch = before.match(/([A-Za-z])\s*$/);   // single-letter series code (A, B, C…)
-      if (letterMatch) series = letterMatch[1].toUpperCase();
+      numStr = numMatch[1].padStart(12, '0');
+      prefix = rawId.slice(0, numMatch.index).trim().toUpperCase();
+      prefix = prefix.replace(/[-_\s]+$/, '');   // strip trailing separators: "B-" → "B"
+    } else {
+      prefix = rawId.toUpperCase();
     }
-    // Fallback: if no trailing number, use the last single-letter run in the id
-    if (!series) {
-      const allLetters = rawId.match(/[A-Za-z]+/g);
-      if (allLetters && allLetters.length) {
-        const last = allLetters[allLetters.length - 1].toUpperCase();
-        if (last.length === 1) series = last;
+
+    // 1) MONTH prefix (JAN..DEC) → month number, so AUG sorts after JUL
+    //    (descending → newest month first). Fixes the July-before-August bug.
+    let monthIdx = -1;
+    for (let mi = 0; mi < FG_MONTHS.length; mi++) {
+      if (prefix.indexOf(FG_MONTHS[mi]) !== -1) { monthIdx = mi + 1; break; }
+    }
+    if (monthIdx > 0) {
+      seriesKey = '9' + String(monthIdx).padStart(2, '0');
+    } else {
+      // 2) single-letter series (B, A, C…) → descending alphabet (B before A)
+      //    ONLY a lone letter counts — "FG" is a prefix, not a series
+      const letterMatch = prefix.match(/^([A-Z])$/);
+      if (letterMatch) seriesKey = '8' + letterMatch[1];
+      // 3) anything else (FG-101, 2026-AUG-...) → use the prefix itself,
+      //    but still try to find a month inside multi-part prefixes
+      else {
+        let innerMonth = -1;
+        for (let mi = 0; mi < FG_MONTHS.length; mi++) {
+          if (prefix.indexOf(FG_MONTHS[mi]) !== -1) { innerMonth = mi + 1; break; }
+        }
+        seriesKey = innerMonth > 0 ? ('9' + String(innerMonth).padStart(2, '0')) : ('7' + prefix.replace(/[^A-Z0-9]/g, ''));
       }
     }
-    // Series dominates the sort; empty series ('   ') sorts AFTER lettered series in
-    // descending order. Number is secondary, then the raw id as final tiebreaker.
-    return series.padEnd(3, ' ') + '|' + (numStr ? numStr.padStart(12, '0') : '000000000000') + '|' + rawId.toUpperCase();
+  } else {
+    seriesKey = '0';   // no student ID → sorts after everything, by date
   }
-  const fallback = (student.firebaseId || student.id || '').toString().trim();
-  return '   |' + '000000000000' + '|' + fallback.toUpperCase();
+
+  // Key order (descending): months (908) > letters (8B) > other (7…) > none (0)
+  return seriesKey + '|' + numStr + '|' + dateKey + '|' + rawId.toUpperCase();
 }
 
-// Suggest the NEXT enrollment number — picks the HIGHEST series letter first
-// (B-series before A-series) and continues numbering inside that series.
+// Suggest the NEXT enrollment number — newest month series first (AUG before JUL),
+// then highest single-letter series (B before A), continuing its numbering.
 function suggestNextEnrollmentNumber() {
   try {
     if (!currentSchoolId) return '';
     const students = (data.students || []).filter(function(s){ return !s.schoolId || s.schoolId === currentSchoolId; });
+    const FG_MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
     const parsed = [];
     (students || []).forEach(function(s){
       const id = String(s.studentId || s.enrollmentNo || s.enrollmentNumber || '').trim();
       if (!id) return;
-      const m = id.match(/([A-Za-z]+)[-_]?(\d+)\s*$/);    // "B-005", "A_12", "FG-A-003" → series + number
-      // Only single-letter series codes count (A, B, C…) — "FG-101" is a prefix, not a series
-      if (m && m[1].length === 1) parsed.push({ series: m[1].toUpperCase(), num: parseInt(m[2], 10), width: m[2].length });
+      const m = id.match(/([A-Za-z]+)[-_]?(\d+)\s*$/);
+      if (!m) return;
+      const prefix = m[1].toUpperCase();
+      let key = '';
+      let label = prefix;
+      const mi = FG_MONTHS.indexOf(prefix);
+      if (mi !== -1) key = 'M' + String(mi + 1).padStart(2, '0');       // AUG-001 → M08
+      else if (prefix.length === 1) key = 'L' + prefix;                  // B-005 → LB
+      else return;                                                       // FG-101 → skip
+      parsed.push({ key: key, label: label, num: parseInt(m[2], 10), width: m[2].length });
     });
     if (parsed.length === 0) return '';
-    // Highest series letter first (descending alphabet: Z → A)
-    const topSeries = parsed.slice().sort(function(a, b){ return b.series.localeCompare(a.series); })[0].series;
-    const inSeries = parsed.filter(function(p){ return p.series === topSeries; });
+    // Newest month first (AUG before JUL), then highest letter (B before A)
+    parsed.sort(function(a, b){ return b.key.localeCompare(a.key); });
+    const top = parsed[0];
+    const inSeries = parsed.filter(function(p){ return p.key === top.key; });
     const maxNum = Math.max.apply(null, inSeries.map(function(p){ return p.num; }));
     const width = Math.max.apply(null, inSeries.map(function(p){ return p.width; }));
-    return topSeries + '-' + String(maxNum + 1).padStart(width, '0');
+    return top.label + '-' + String(maxNum + 1).padStart(width, '0');
   } catch(e) { console.warn('suggestNextEnrollmentNumber failed:', e.message); return ''; }
 }
 
@@ -23013,5 +23048,5 @@ function populateFormFromStudentId(value) {
   <div id="fg-wa-panel-list" style="max-height:280px;overflow:auto;display:flex;flex-direction:column;gap:8px;"></div>
 </div>
 
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a2deb4d769e2e730',t:'MTc4NzIwMDY4NA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
